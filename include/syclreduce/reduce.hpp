@@ -8,37 +8,47 @@ namespace syclreduce {
 // R should follow the Reduction Interface:
 //
 // typename T
-// static void identity(T &) {}
-// static void combine(const T &, T &) {}
+// void identity(T &) const {}
+// void combine(const T &, T &) const {}
 
 /** A reducer applies a Reduction to data placed
  *  into its buffer.
  */
 template <typename R>
 class Reducer {
+	friend class Reducer<R>;
+
     sycl::buffer<typename R::T,1> buf;
 	size_t ngrp;
+	R op; // const, but we need to overwrite it on operator=
 
   public:
     using Reduction = R;
     using T = typename R::T;
 
-	Reducer() : buf(0), ngrp(0) {}
-	Reducer(size_t _ngrp) : buf(_ngrp), ngrp(_ngrp) {}
+	Reducer(const Reduction &op) : buf(0), ngrp(0), op(op) {}
+	Reducer(const Reduction &op, size_t _ngrp)
+			: buf(_ngrp), ngrp(_ngrp), op(op) {}
+	Reducer(const Reducer<R> &other, size_t _ngrp)
+			: buf(_ngrp), ngrp(_ngrp), op(other.op) {}
 
 	auto accessor(sycl::handler &cgh) {
 		return sycl::accessor(buf, cgh, sycl::write_only, sycl::no_init);
 	}
 
+    const R oper() {
+		return op;
+	}
+
     T get() {
 	    T ret;
 		if(ngrp == 0) {
-			R::identity(ret);
+			op.identity(ret);
 		} else {
 			sycl::host_accessor X(buf, sycl::read_only);
 			ret = X[0];
 			for(size_t i=1; i<ngrp; ++i) {
-				R::combine(ret, X[i]);
+				op.combine(ret, X[i]);
 			}
 		}
 		return ret;
@@ -49,10 +59,10 @@ class Reducer {
 template <typename TT>
 struct Sum {
 	using T = TT;
-	static void identity(T &x) {
+	void identity(T &x) const {
 		x = (T)0;
 	}
-	static void combine(T &x, const T &y) {
+	void combine(T &x, const T &y) const {
 		x += y;
 	}
 };
@@ -60,10 +70,10 @@ struct Sum {
 template <typename TT>
 struct Prod {
 	using T = TT;
-	static void identity(T &x) {
+	void identity(T &x) const {
 		x = (T)1;
 	}
-	static void combine(T &x, const T &y) {
+	void combine(T &x, const T &y) const {
 		x *= y;
 	}
 };
@@ -81,31 +91,112 @@ void parallel_reduce(
 	using T = typename Reducer::T;
 	size_t ngrp   = rng.get_group_range().size();
 	size_t nlocal = rng.get_local_range().size();
-	Reducer ans( ngrp );
+	Reducer ans(red, ngrp);
 	auto X = ans.accessor(cgh);
 
 	red = ans;
 	sycl::local_accessor<T,1> wg_sum(nlocal, cgh);
 								//sycl::read_write, sycl::no_init);
 
-	cgh.parallel_for(rng, [=](sycl::nd_item<Dim> it) {
+	cgh.parallel_for(rng, [=,op=red.oper()](sycl::nd_item<Dim> it) {
 		T val = kernel(it);
 
 		sycl::group<Dim> grp = it.get_group();
 
-		// reduce over work items in this wg
-		// TODO: make use of sycl::sub_group shift operators
+		// Reduce over work items in this wg.
+		//
+		// TODO: make use of sycl::sub_group shift operators.
+		//
+		//   This requires specializing the algo. for different
+		//   possible sub_group sizes.
 		int li         = grp.get_local_linear_id();
 		int local_size = grp.get_local_linear_range();
 		wg_sum[li] = val;
 		for (int offset = 1; offset < local_size; offset *= 2) {
 			sycl::group_barrier(grp);
 			if(li + offset < local_size)
-				Reduction::combine(wg_sum[li], wg_sum[li + offset]);
+				op.combine(wg_sum[li], wg_sum[li + offset]);
 		}
 		if (li == 0)
 			X[it.get_group(0)] = wg_sum[0];
 	});
+}
+
+/** Assuming a work group / subgroup layout dividing
+ *  members via sg.get_group_linear_id() and sg.get_local_linear_id()
+ *
+ *  into blocks of P x Q, we have (e.g. for grp.range x sg.range = 4x16
+ *  and PxQ = 2x8,
+ *
+ *      |               |        
+ * - 0: 0 1 2 3 4 5 6 7 8 9 A B C D E F
+ *   1: 0 1 2 3 4 5 6 7 8 9 A B C D E F
+ * - 2: 0 1 2 3 4 5 6 7 8 9 A B C D E F
+ *   3: 0 1 2 3 4 5 6 7 8 9 A B C D E F
+ *
+ * During reduction, we accumulate 4 results -- one for each
+ * PxQ sub-block.  This is accomplished by doing a row-wise reduction
+ * to sub_group id-s 0 and 8, followed by a column-wise reduction
+ * among all "sg.get_group_linear_range()/P"
+ *                   x "sg.get_local_linear_range()/Q" sub-group leaders.
+ *  
+ */
+
+/** Reduce over all vector lanes within a sub_group.
+ *  (i.e. column-wise)
+ *
+ *  A final result will be present on elements where:
+ *    sg.get_local_linear_id() % Q == 0
+ *
+ *  It is assumed that sg.get_local_linear_range() % Q == 0.
+ *
+ */
+template <int Q, typename Reduction>
+void subgroup_reduce(sycl::sub_group sg,
+					 const Reduction &op, typename Reduction::T &x) {
+	using T = typename Reduction::T;
+	const int tid = sg.get_local_linear_id();
+
+    for(int z=1; z<Q; z*=2) {
+		T y = sycl::shift_group_left(sg, x, z);
+		if(tid+z < Q) {
+			op.combine(x, y);
+		}
+    }
+}
+
+/** Shared memory reduction over all sub_group leaders.
+ *  (i.e. row-wise)
+ *
+ *  Uses shared memory equal to rng := sg.get_group_linear_range()
+ *
+ *  A final result will be present on elements where:
+ *    sg.get_group_linear_id() % P == 0
+ *
+ *  It is assumed that len(tmp) == rng.
+ *
+ *  To work with the kind of 2D reductions described above,
+ *  call this on every sub-group thread where wg.get_local_linear_id()%Q == 0,
+ *  and provide a unique shared memory address (tmp) for each
+ *     q = wg.get_local_linear_id()/Q.
+ *
+ */
+template <int P, typename Reduction>
+void shmem_reduce(sycl::group<1> grp, sycl::sub_group sg, const Reduction &op,
+				  typename Reduction::T &x, typename Reduction::T *tmp) {
+	using T = typename Reduction::T;
+	const int gid = sg.get_group_linear_id();
+	const int rng = sg.get_group_linear_range(); // len(tmp)
+
+	tmp[gid] = x;
+    for(int z=1; z<P; z*=2) {
+		sycl::group_barrier(grp);
+		if(gid+z < P) {
+			op.combine(tmp[gid], tmp[gid+z]);
+		}
+    }
+	if(gid % P == 0)
+		x = tmp[gid];
 }
 
 }
