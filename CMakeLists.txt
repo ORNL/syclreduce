@@ -1,3 +1,7 @@
+# Note - this is header-only, so we don't care what
+# SYCL is being used.
+# Downstreams are responsible for requiring sycl independently.
+#
 cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
 
 project(syclreduce VERSION 0.0.1 LANGUAGES CXX)
@@ -9,14 +13,6 @@ include(install)
 
 # Set a default build type if none was specified
 set(DEFAULT_BUILD_TYPE "Release")
-
-###################################################################################################
-# - find packages we depend on --------------------------------------------------------------------
-
-## Setup SYCL
-### Due to CMake limitations, hipSYCL requires C++ standard to be set manually
-#set(CMAKE_SYCL_FLAGS "${CMAKE_SYCL_FLAGS} -std=c++17")
-#find_package(hipSYCL CONFIG REQUIRED)
 
 ###################################################################################################
 # - define target   -------------------------------------------------------------------------------

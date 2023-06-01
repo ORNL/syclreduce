@@ -1,6 +1,7 @@
 #ifndef _SYCLREDUCE_REDUCE_HPP
 #define _SYCLREDUCE_REDUCE_HPP
 
+#include <type_traits>
 #include <sycl/sycl.hpp>
 
 namespace syclreduce {
@@ -26,14 +27,43 @@ class Reducer {
     using Reduction = R;
     using T = typename R::T;
 
-	Reducer(const Reduction &op) : buf(0), ngrp(0), op(op) {}
+	/** Note: these constructors all place the identity element in the
+	 *  first buffer entry.  This ensures that we can always fall-back
+	 *  to the SYCL implementation's reduction.
+	 */
+	Reducer(const Reduction &op) : buf(1), ngrp(0), op(op) {
+        sycl::host_accessor X(buf, sycl::write_only, sycl::no_init);
+		op.identity(X[0]);
+	}
 	Reducer(const Reduction &op, size_t _ngrp)
-			: buf(_ngrp), ngrp(_ngrp), op(op) {}
+			: buf(_ngrp), ngrp(_ngrp), op(op) {
+		if(_ngrp < 1) {
+			throw std::invalid_argument("Invalid buffer size.");
+		}
+		sycl::host_accessor X(buf, sycl::write_only, sycl::no_init);
+		op.identity(X[0]);
+	}
 	Reducer(const Reducer<R> &other, size_t _ngrp)
-			: buf(_ngrp), ngrp(_ngrp), op(other.op) {}
+			: buf(other.buf), ngrp(other.ngrp), op(other.op) {
+		realloc(_ngrp);
+	}
+	void realloc(size_t _ngrp) {
+		if(_ngrp < 1) {
+			throw std::invalid_argument("Invalid buffer size.");
+		}
+		if(ngrp < _ngrp) { // actually need to realloc
+			buf = sycl::buffer<typename R::T,1>(_ngrp);
+			sycl::host_accessor X(buf, sycl::write_only, sycl::no_init);
+			op.identity(X[0]);
+		}
+		ngrp = _ngrp;
+	}
 
 	auto accessor(sycl::handler &cgh) {
 		return sycl::accessor(buf, cgh, sycl::write_only, sycl::no_init);
+	}
+	sycl::buffer<typename R::T,1> &buffer() {
+		return buf;
 	}
 
     const R oper() {
@@ -78,7 +108,7 @@ struct Prod {
 	}
 };
 
-/** Replaces red with a new reducer.
+/** Custom parallel reduce.
  */
 template <int Dim, typename Reducer, typename Kernel>
 void parallel_reduce(
@@ -91,10 +121,9 @@ void parallel_reduce(
 	using T = typename Reducer::T;
 	size_t ngrp   = rng.get_group_range().size();
 	size_t nlocal = rng.get_local_range().size();
-	Reducer ans(red, ngrp);
-	auto X = ans.accessor(cgh);
+	red.realloc(ngrp);
+	auto X = red.accessor(cgh);
 
-	red = ans;
 	sycl::local_accessor<T,1> wg_sum(nlocal, cgh);
 								//sycl::read_write, sycl::no_init);
 
@@ -120,6 +149,98 @@ void parallel_reduce(
 		if (li == 0)
 			X[it.get_group(0)] = wg_sum[0];
 	});
+}
+
+/*
+template <int Dim, typename Reducer, typename Kernel>
+void parallel_reduce(
+		sycl::handler &cgh, sycl::range<Dim> rng,
+		Reducer &red,
+		const Kernel &kernel) {
+	// should statically assert this:
+	//using T = invoke_result_t<Kernel, nd_item<Dim> >;
+	using Reduction = typename Reducer::Reduction;
+	using T = typename Reducer::T;
+	size_t ngrp   = 16;
+	size_t nlocal = 1;
+	auto X = ans.accessor(cgh);
+	sycl::nd_range<Dim> nrng( ... );
+
+	red.realloc(1);
+	sycl::local_accessor<T,1> wg_sum(nlocal, cgh);
+								//sycl::read_write, sycl::no_init);
+
+	cgh.parallel_for(nrng, [=,op=red.oper()](sycl::nd_item<Dim> it) {
+		T val = kernel(it);
+
+		sycl::group<Dim> grp = it.get_group();
+
+		int li         = grp.get_local_linear_id();
+		int local_size = grp.get_local_linear_range();
+		wg_sum[li] = val;
+		for (int offset = 1; offset < local_size; offset *= 2) {
+			sycl::group_barrier(grp);
+			if(li + offset < local_size)
+				op.combine(wg_sum[li], wg_sum[li + offset]);
+		}
+		if (li == 0)
+			X[it.get_group(0)] = wg_sum[0];
+	});
+}*/
+
+///
+/// Definition for compatibility with SYCL reduce spec.
+template <typename R>
+struct BinaryOp : public R {
+	using Reduction = R;
+	using T = typename R::T;
+	BinaryOp(const Reduction &x) : R(x) {}
+    T operator()(const T& x, const T& y) const {
+		T z = x;
+		this->combine(z, y);
+		return z;
+	}
+};
+
+// trick from https://devblogs.microsoft.com/oldnewthing/20190710-00/?p=102678
+template<typename, typename = void>
+constexpr bool is_type_complete_v = false;
+
+template<typename T>
+constexpr bool is_type_complete_v
+    <T, std::void_t<decltype(sizeof(T))>> = true;
+
+/// Work-around for hipsycl's early reduction API that required
+/// accessors instead of buffers.
+template <typename T, int dim, typename BinaryOp, typename = void>
+auto reduction(sycl::buffer<T,dim> &buf, sycl::handler &cgh, BinaryOp &op) {
+	if constexpr(is_type_complete_v<hipsycl::sycl::access_mode>) {
+		sycl::accessor acc(buf, cgh, sycl::read_write);
+		typename BinaryOp::T identity;
+
+		op.identity(identity);
+		return sycl::reduction(acc, identity, op);
+	} else {
+		return sycl::reduction(buf, cgh, op);
+	}
+}
+
+template <int Dim, typename Reducer, typename Kernel>
+void parallel_reduce(
+		sycl::handler &cgh, sycl::range<Dim> rng,
+		Reducer &red, const Kernel &kernel) {
+	// should statically assert this:
+	//using T = invoke_result_t<Kernel, nd_item<Dim> >;
+	using Reduction = typename Reducer::Reduction;
+	using T = typename Reducer::T;
+	red.realloc(1);
+
+	BinaryOp<Reduction> BR{red.oper()};
+
+	cgh.parallel_for(rng, reduction(red.buffer(), cgh, BR),
+					 [=](sycl::id<Dim> id, auto &ret) {
+		ret.combine( kernel(id) );
+    });
 }
 
 /** Assuming a work group / subgroup layout dividing
