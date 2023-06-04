@@ -202,26 +202,32 @@ struct BinaryOp : public R {
 	}
 };
 
-// trick from https://devblogs.microsoft.com/oldnewthing/20190710-00/?p=102678
-template<typename, typename = void>
-constexpr bool is_type_complete_v = false;
+// detection idiom https://en.cppreference.com/w/cpp/experimental/is_detected
+namespace detail {
+	template<typename = void, typename... Args>
+	struct detect_reduction : std::false_type {};
 
-template<typename T>
-constexpr bool is_type_complete_v
-    <T, std::void_t<decltype(sizeof(T))>> = true;
+	template<typename... Args>
+	struct detect_reduction<std::void_t<decltype(sycl::reduction(std::declval<Args>()...))>, Args...>
+		: std::true_type {};
 
-/// Work-around for hipsycl's early reduction API that required
-/// accessors instead of buffers.
-template <typename T, int dim, typename BinaryOp, typename = void>
-auto reduction(sycl::buffer<T,dim> &buf, sycl::handler &cgh, BinaryOp &op) {
-	if constexpr(is_type_complete_v<hipsycl::sycl::access_mode>) {
-		sycl::accessor acc(buf, cgh, sycl::read_write);
-		typename BinaryOp::T identity;
+	template<typename... Args>
+	inline constexpr bool detect_reduction_v = detect_reduction<void, Args...>::value;
 
-		op.identity(identity);
-		return sycl::reduction(acc, identity, op);
-	} else {
-		return sycl::reduction(buf, cgh, op);
+	/// Work-around for hipsycl's early reduction API that required
+	/// accessors instead of buffers.
+	template <typename T, int dim, typename BinaryOp, typename = void>
+	auto reduction(sycl::buffer<T,dim> &buf, sycl::handler &cgh, BinaryOp &op) {
+		if constexpr(detect_reduction_v<sycl::buffer<T,dim>&,
+												sycl::handler&, BinaryOp>) {
+			return sycl::reduction(buf, cgh, op);
+		} else {
+			sycl::accessor acc(buf, cgh, sycl::read_write);
+			typename BinaryOp::T identity;
+
+			op.identity(identity);
+			return sycl::reduction(acc, identity, op);
+		}
 	}
 }
 
@@ -237,7 +243,7 @@ void parallel_reduce(
 
 	BinaryOp<Reduction> BR{red.oper()};
 
-	cgh.parallel_for(rng, reduction(red.buffer(), cgh, BR),
+	cgh.parallel_for(rng, detail::reduction(red.buffer(), cgh, BR),
 					 [=](sycl::id<Dim> id, auto &ret) {
 		ret.combine( kernel(id) );
     });

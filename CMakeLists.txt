@@ -17,6 +17,7 @@ set(DEFAULT_BUILD_TYPE "Release")
 ###################################################################################################
 # - define target   -------------------------------------------------------------------------------
 add_library(syclreduce INTERFACE)
+add_library(syclreduce::syclreduce ALIAS syclreduce) # for CPM imports
 FILE(GLOB REDUCE_HEADERS include/syclreduce/*.hpp)
 target_compile_features(syclreduce INTERFACE cxx_std_17)
 target_include_directories(syclreduce INTERFACE
