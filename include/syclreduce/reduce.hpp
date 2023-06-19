@@ -244,7 +244,7 @@ void parallel_reduce(
 	BinaryOp<Reduction> BR{red.oper()};
 
 	cgh.parallel_for(rng, detail::reduction(red.buffer(), cgh, BR),
-					 [=](sycl::id<Dim> id, auto &ret) {
+					 [=](sycl::item<Dim> id, auto &ret) {
 		ret.combine( kernel(id) );
     });
 }
